@@ -1,0 +1,294 @@
+blueprint:
+  name: Auto Lights - Short + Long Trigger Timer
+  description: |
+    Reusable auto-lights blueprint with:
+    - short triggers (door open / motion / occupancy) -> short timer
+    - long triggers (wireless button click, etc.) -> long timer
+    - optional companion targets (plug/switch/etc.) for long mode
+    - optional manual light-on detection (physical knob / wall switch)
+
+    Behavior:
+    - Short triggers only act when the timer is idle or currently set to a short duration.
+    - Long triggers:
+      - if idle/short -> start long timer and turn on light + companion targets
+      - if already in long mode -> turn everything off
+    - If the main light is manually turned on, the blueprint can start long mode
+      and toggle the companion targets.
+  domain: automation
+  author: Stiven
+  input:
+    main_light:
+      name: Main light
+      description: The primary light entity this automation controls.
+      selector:
+        entity:
+          domain: light
+
+    timer_entity:
+      name: Timer
+      description: Timer helper used to track short/long mode.
+      selector:
+        entity:
+          domain: timer
+
+    companion_targets:
+      name: Companion targets
+      description: |
+        Optional extra targets for long mode, such as a plug or switch.
+        These turn on with long triggers, turn off when the timer expires,
+        and are toggled when the light is manually turned on.
+      default: {}
+      selector:
+        target:
+          entity:
+            domain:
+              - switch
+              - light
+              - fan
+              - input_boolean
+
+    short_triggers:
+      name: Short triggers
+      description: |
+        Triggers for short mode, such as door open, motion, or occupancy.
+      default: []
+      selector:
+        trigger:
+
+    long_triggers:
+      name: Long triggers
+      description: |
+        Triggers for long mode, such as a wireless button single click.
+      default: []
+      selector:
+        trigger:
+
+    short_duration:
+      name: Short duration
+      description: How long short mode should run.
+      default:
+        minutes: 1
+      selector:
+        duration:
+          enable_day: false
+          enable_second: true
+
+    long_duration:
+      name: Long duration
+      description: How long long mode should run.
+      default:
+        minutes: 30
+      selector:
+        duration:
+          enable_day: false
+          enable_second: true
+
+    enable_manual_light_on:
+      name: Enable manual light-on handling
+      description: |
+        When enabled, a manual turn-on of the main light starts long mode
+        and toggles the companion targets.
+      default: true
+      selector:
+        boolean:
+
+triggers:
+  - trigger: state
+    entity_id: !input timer_entity
+    from: active
+    to: idle
+    id: timer_expired
+
+  - trigger: state
+    entity_id: !input main_light
+    from: "on"
+    to: "off"
+    id: light_turned_off
+
+  - trigger: state
+    entity_id: !input main_light
+    from: "off"
+    to: "on"
+    id: light_turned_on
+
+  - triggers: !input short_triggers
+  - triggers: !input long_triggers
+
+conditions: []
+
+actions:
+  - variables:
+      main_light_entity: !input main_light
+      timer_helper: !input timer_entity
+      companion: !input companion_targets
+      short_trigger_list: !input short_triggers
+      long_trigger_list: !input long_triggers
+      short_duration_input: !input short_duration
+      long_duration_input: !input long_duration
+      manual_light_on_enabled: !input enable_manual_light_on
+
+      static_trigger_count: 3
+      current_trigger_idx: "{{ trigger.idx | int(-1) }}"
+      short_trigger_count: "{{ short_trigger_list | count }}"
+      long_trigger_start_idx: "{{ static_trigger_count + (short_trigger_list | count) }}"
+
+      is_short_trigger: >-
+        {{
+          current_trigger_idx >= static_trigger_count
+          and current_trigger_idx < long_trigger_start_idx
+        }}
+
+      is_long_trigger: >-
+        {{ current_trigger_idx >= long_trigger_start_idx }}
+
+      has_companion: >-
+        {{ companion is mapping and companion | length > 0 }}
+
+      current_duration_str: >-
+        {{ state_attr(timer_helper, 'duration') | default('0:00:00', true) }}
+
+      current_duration_parts: >-
+        {{ current_duration_str.split(':') if current_duration_str is string else ['0','0','0'] }}
+
+      current_duration_seconds: >-
+        {{
+          (current_duration_parts[0] | int * 3600)
+          + (current_duration_parts[1] | int * 60)
+          + (current_duration_parts[2] | int)
+        }}
+
+      short_duration_seconds: >-
+        {{
+          (short_duration_input.get('days', 0) | int * 86400)
+          + (short_duration_input.get('hours', 0) | int * 3600)
+          + (short_duration_input.get('minutes', 0) | int * 60)
+          + (short_duration_input.get('seconds', 0) | int)
+        }}
+
+      timer_short_or_idle: >-
+        {{
+          is_state(timer_helper, 'idle')
+          or current_duration_seconds <= short_duration_seconds
+        }}
+
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: timer_expired
+        sequence:
+          - parallel:
+              - action: homeassistant.turn_off
+                target:
+                  entity_id: !input main_light
+              - if:
+                  - condition: template
+                    value_template: "{{ has_companion }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target: !input companion_targets
+
+      - conditions:
+          - condition: trigger
+            id: light_turned_off
+        sequence:
+          - parallel:
+              - if:
+                  - condition: state
+                    entity_id: !input timer_entity
+                    state: active
+                then:
+                  - action: timer.finish
+                    target:
+                      entity_id: !input timer_entity
+              - if:
+                  - condition: template
+                    value_template: "{{ has_companion }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target: !input companion_targets
+
+      - conditions:
+          - condition: trigger
+            id: light_turned_on
+          - condition: template
+            value_template: "{{ manual_light_on_enabled }}"
+          - condition: template
+            value_template: "{{ trigger.to_state.context.parent_id == none }}"
+        sequence:
+          - parallel:
+              - action: timer.start
+                target:
+                  entity_id: !input timer_entity
+                data:
+                  duration: !input long_duration
+              - if:
+                  - condition: template
+                    value_template: "{{ has_companion }}"
+                then:
+                  - action: homeassistant.toggle
+                    target: !input companion_targets
+
+      - conditions:
+          - condition: template
+            value_template: "{{ is_short_trigger and timer_short_or_idle }}"
+        sequence:
+          - parallel:
+              - action: timer.start
+                target:
+                  entity_id: !input timer_entity
+                data:
+                  duration: !input short_duration
+              - if:
+                  - condition: state
+                    entity_id: !input main_light
+                    state: "off"
+                then:
+                  - action: light.turn_on
+                    target:
+                      entity_id: !input main_light
+
+      - conditions:
+          - condition: template
+            value_template: "{{ is_long_trigger }}"
+        sequence:
+          - choose:
+              - conditions:
+                  - condition: template
+                    value_template: "{{ timer_short_or_idle }}"
+                sequence:
+                  - parallel:
+                      - action: timer.start
+                        target:
+                          entity_id: !input timer_entity
+                        data:
+                          duration: !input long_duration
+                      - action: homeassistant.turn_on
+                        target:
+                          entity_id: !input main_light
+                      - if:
+                          - condition: template
+                            value_template: "{{ has_companion }}"
+                        then:
+                          - action: homeassistant.turn_on
+                            target: !input companion_targets
+            default:
+              - parallel:
+                  - if:
+                      - condition: state
+                        entity_id: !input timer_entity
+                        state: active
+                    then:
+                      - action: timer.finish
+                        target:
+                          entity_id: !input timer_entity
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: !input main_light
+                  - if:
+                      - condition: template
+                        value_template: "{{ has_companion }}"
+                    then:
+                      - action: homeassistant.turn_off
+                        target: !input companion_targets
+
+mode: queued
